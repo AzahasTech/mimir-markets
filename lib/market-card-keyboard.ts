@@ -93,6 +93,52 @@ export function shouldActivateMarketCard(key: string): boolean {
 }
 
 /**
+ * Whether the given keyboard target is a text-entry control where keyboard
+ * shortcuts must not intercept keystrokes. Covers inputs, textareas, selects,
+ * and contenteditable regions. Pure predicate so it can be unit tested.
+ */
+export function isTypingTarget(target: {
+  tagName?: string;
+  isContentEditable?: boolean;
+  getAttribute?: (name: string) => string | null;
+} | null | undefined): boolean {
+  if (!target) return false;
+  const tag = (target.tagName || "").toUpperCase();
+  if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") {
+    return true;
+  }
+  if (target.isContentEditable) return true;
+  const editable = target.getAttribute?.("contenteditable");
+  if (editable && editable.toLowerCase() !== "false") return true;
+  return false;
+}
+
+/**
+ * Whether the "?" key should open the keyboard-shortcuts help.
+ * Respects modifier keys and ignores typing targets so it never fires while
+ * the user is entering text.
+ */
+export function shouldOpenKeyboardHelp(
+  key: string,
+  target: {
+    tagName?: string;
+    isContentEditable?: boolean;
+    getAttribute?: (name: string) => string | null;
+  } | null | undefined,
+  modifiers: {
+    altKey?: boolean;
+    ctrlKey?: boolean;
+    metaKey?: boolean;
+  } = {},
+): boolean {
+  if (key !== "?") return false;
+  if (modifiers.altKey || modifiers.ctrlKey || modifiers.metaKey) {
+    return false;
+  }
+  return !isTypingTarget(target);
+}
+
+/**
  * Roving tabindex: only the active navigable card is in tab order (0);
  * others are -1. Non-navigable cards stay out of the arrow sequence (-1).
  */

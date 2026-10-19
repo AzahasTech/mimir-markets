@@ -16,6 +16,7 @@
 import { NextResponse } from "next/server";
 import { authorizeRequest } from "@/lib/api/policy";
 import { pruneExpiredNonces } from "@/lib/server/nonce-store";
+import { pruneExpiredRateLimitWindows } from "@/lib/api/rate-limit";
 
 export const dynamic = "force-dynamic";
 
@@ -40,8 +41,9 @@ export async function GET(request: Request) {
 
   try {
     const pruned = await pruneExpiredNonces();
+    const rateLimitWindowsPruned = await pruneExpiredRateLimitWindows();
     return NextResponse.json(
-      { pruned, at: Date.now() },
+      { pruned, rateLimitWindowsPruned, at: Date.now() },
       { headers: { "Cache-Control": "no-store" } },
     );
   } catch (error) {

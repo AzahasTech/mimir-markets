@@ -1,7 +1,7 @@
 /**
  * Fail-closed changed-path classification for CI.
  *
- * The one rule this module encodes: CI decides what to run from an *allowlist*.
+ * The one rule this module encodes: CI decides what to run from an *allowlist.
  * A changed path either matches a known scope and enables it, or it matches
  * nothing and is UNKNOWN. Unknown paths fail the path job — they never
  * silently skip the suites they were invisible to. Filters that fail open are
@@ -17,6 +17,8 @@
  *    `check:driver-parity` are what catch it.
  *
  * Keep in sync with `scripts/ci/changed-paths.mjs` (same lists, same rules).
+ * See `docs/CI_PATH_SCOPES.md` for the tier matrix and the checklist for
+ * adding a new path.
  */
 
 export type Tier = "app" | "agents" | "contracts" | "tests";

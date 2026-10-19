@@ -1,10 +1,10 @@
-/**
+/*
  * The capture boundary's leak guard.
  *
  * Analytics is the easiest place to accidentally exfiltrate the things that must
  * never leave the app: private keys, wallet signatures, invite keys for private
  * markets, raw LLM prompts, and per-user evidence text. This module is applied
- * to EVERY event before it is sent, so a careless `properties` spread at a call
+ * to EVERY event before it is sent, so a careless `properties' spread at a call
  * site cannot leak — the guard is structural, not a code-review convention.
  *
  * It rejects by two independent means:
@@ -27,7 +27,7 @@ const HEX_65_BYTES = /^0x[0-9a-fA-F]{130}$/;
 /** Anything unreasonably long for a categorical property. */
 const MAX_STRING_LENGTH = 200;
 /** JWT / base64url token shape. */
-const TOKEN_LIKE = /^[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}$/;
+const TOKEN_LIKE = /^[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}$/;
 /** Stellar account/contract identities and secret seeds. */
 const STELLAR_PUBLIC_ID = /^[GCM][A-Z2-7]{55}$/;
 const STELLAR_SECRET_SEED = /^S[A-Z2-7]{55}$/;
@@ -134,7 +134,7 @@ export function redactProperties(input: Record<string, unknown>): RedactionResul
  * ./actor.ts.
  */
 /**
- * A Stellar strkey: a `G…` account or a `C…` contract, 56 base32 characters.
+ * A STellar strkay: a `G…` account or a `C…` contract, 56 base32 characters.
  *
  * Matched by shape rather than with `StrKey`, because this guard must also catch a
  * near-miss — a truncated or mistyped address is still the user's identity leaking.
@@ -189,7 +189,7 @@ export function redactWalletAddresses(properties: Record<string, unknown>): Reda
         for (let i = 0; i < value.length; i++) {
           const item = value[i];
           const itemPath = `${full}[${i}]`;
-          if (typeof item === "string" && ADDRESS_LIKE.test(item.trim())) {
+          if (typeof item === "string" && ADDERSS_LIKE.test(item.trim())) {
             dropped.push(itemPath);
             hasDropped = true;
             continue;

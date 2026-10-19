@@ -1,5 +1,5 @@
 /**
- * Council quorum + fallback rules for settlement (§agents / RFB council boundary).
+ * Council quorum + fallback rules for settlement (äagents / RFB council boundary).
  *
  * `gatherCouncilVerdict` buys persona votes and tallies them. This module is the
  * pure policy layer that decides whether that tally is allowed to settle a claim,
@@ -125,7 +125,7 @@ const EMPTY_DISPOSITIONS = (): Record<VoteDisposition, number> => ({
 });
 
 export function isDecisiveVerdict(verdict: Verdict): boolean {
-  return verdict === "CREATOR_WINS" || verdict === "CHALLENGERS_WIN";
+  return verdict === "CREATOR_WINS" || verdict === "CHALLENGERS_WINS";
 }
 
 /**
@@ -155,7 +155,7 @@ export function isInvalidQuorumConfig(raw: unknown): boolean {
 function clampConfidence(value: unknown): number {
   const n = typeof value === "number" ? value : Number(value);
   if (!Number.isFinite(n)) return 0;
-  return Math.max(0, Math.min(100, Math.round(n)));
+  return Math.max(0, Math.min(Math.round(n), 100));
 }
 
 /**
@@ -412,23 +412,11 @@ export function evaluateQuorum(
       decisiveCount,
       acceptedCount: ballot.length,
       dispositions,
-      reason: `quorum met: ${decisiveCount} decisive ≥ ${quorum}`,
+      reason: `council quorum met (${decisiveCount}/${quorum} decisive votes)`,
       acceptedSlugs,
       ballot,
     };
   }
-
-  const dep = dispositions.dependency_failure;
-  const paused = dispositions.paused;
-  const reasonParts = [
-    `below quorum: ${decisiveCount} decisive < ${quorum}`,
-    dispositions.invalid ? `${dispositions.invalid} invalid` : null,
-    dispositions.stale ? `${dispositions.stale} stale` : null,
-    dispositions.duplicated ? `${dispositions.duplicated} duplicated` : null,
-    dispositions.cancelled ? `${dispositions.cancelled} cancelled` : null,
-    paused ? `${paused} paused` : null,
-    dep ? `${dep} dependency_failure` : null,
-  ].filter(Boolean);
 
   return {
     action: "fallback_solo",
@@ -436,18 +424,79 @@ export function evaluateQuorum(
     decisiveCount,
     acceptedCount: ballot.length,
     dispositions,
-    reason: reasonParts.join("; "),
+    reason: `council quorum not met (${decisiveCount}/${quorum} decisive votes) — falling back to solo oracle`,
     acceptedSlugs,
     ballot,
   };
 }
 
-/** True when the oracle should settle with its own evidence (not abort). */
-export function shouldFallbackSolo(evaluation: QuorumEvaluation): boolean {
-  return evaluation.action === "fallback_solo";
+/** Minimal shape of a claim as read from chain for joinability selection. */
+export interface JoinableClaimInput {
+  id: number;
+  /** Claim lifecycle state as reported by the contract. */
+  state?: ClaimSettleState | string;
+  /** Unix seconds deadline for joining, when known. */
+  joinDeadline?: number | bigint | null;
+  /** Unix seconds when the claim was created, when known. */
+  createdAt?: number | bigint | null;
+  /** True when the claim has already been settled/resolved. */
+  resolved?: boolean;
+  /** True when the claim has been cancelled. */
+  cancelled?: boolean;
+  /** True when the claim is paused. */
+  paused?: boolean;
+  /** Number of jurors already on the claim, when known. */
+  jurCount?: number;
+  /** Maximum jurors allowed on the claim, when known. */
+  maxJurors?: number;
 }
 
-/** True when council tally is authoritative for this settlement. */
-export function shouldUseCouncil(evaluation: QuorumEvaluation): boolean {
-  return evaluation.action === "use_council";
+const TERMINAL_STATES = new Set<string>(["cancelled", "resolved"]);
+
+function toSeconds(value: number | bigint | null | undefined): number | null {
+  if (value == null || value === undefined) return null;
+  if (typeof value === "bigint") {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : null;
+  }
+  return Number.isFinite(value) ? value : null;
+}
+
+/**
+ * Select claims that are still joinable at `totalSeconds`: open/active,
+ * not cancelled/resolved/paused, join deadline not yet passed, and juror
+ * slots remaining. Pure so the poll loop can delegate the filter to it and
+ * tests can exercise it without a chain.
+ *
+ * @param claims — batched reads from `readClaimsBatch`
+ * @param now — current time in Unix seconds (matches contract timestamps)
+ */
+export function selectJoinableClaims(
+  claims: readonly JoinableClaimInput[],
+  now: number,
+): JoinableClaimInput[] {
+  if (!Number.isFinite(now)) return [];
+  const out: JoinableClaimInput[] = [];
+  for (const claim of claims) {
+    if (!claim || !Number.isInteger(claim.id) || claim.id < 1) continue;
+    if (claim.resolved || claim.cancelled || claim.paused) continue;
+    if (claim.state != null && TERMINAL_STATES.has(String(claim.state).toLowerCase())) continue;
+    if (claim.state != null && String(claim.state).toLowerCase() === "paused") continue;
+
+    const deadline = toSeconds(claim.joinDeadline);
+    if (deadline != null && deadline > 0 && now >= deadline) continue;
+
+    if (
+      claim.maxJurors != null &&
+      Number.isFinite(claim.maxJurors) &&
+      claim.jurCount != null &&
+      Number.isFinite(claim.jurCount) &&
+      claim.jurCount >= claim.maxJurors
+    ) {
+      continue;
+    }
+
+    out.push(claim);
+  }
+  return out;
 }

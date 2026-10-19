@@ -74,6 +74,7 @@ guidance is in [`docs/LEDGER_REPLAY.md`](docs/LEDGER_REPLAY.md).
 - [Paid resources over x402](#paid-resources-over-x402)
 - [Tech stack](#tech-stack)
 - [Repository layout](#repository-layout)
+- [Contract storage keys & TTLs](#contract-storage-keys--ttls)
 - [Local setup](#local-setup)
 - [End-to-end demo](#end-to-end-demo)
 - [Production deploy (Vercel + Railway)](#production-deploy-vercel--railway)
@@ -805,6 +806,8 @@ mimir-markets/
     ├── node/                             # node:test unit + integration suites
     └── browser/                          # Playwright browser smoke suite (npm run smoke:browser)
 ```
+
+See [`docs/CONTRACT_STORAGE.md`](docs/CONTRACT_STORAGE.md) for the module-level guide to `mimir-market` storage keys: every `DataKey` variant, its storage class (instance vs persistent), value type, TTL policy (`BUMP_THRESHOLD`/`BUMP_EXTEND`), which entry points touch it, and which reads extend TTL.
 
 ---
 

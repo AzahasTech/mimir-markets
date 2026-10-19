@@ -9,12 +9,16 @@ import {
   buildMarketCardNavItems,
   decideMarketCardKey,
   inferGridColumns,
+  isTypingTarget,
+  shouldOpenKeyboardHelp,
   type MarketCardNavItem,
 } from "@/lib/market-card-keyboard";
 
 export interface UseMarketCardGridKeyboardOptions {
   /** Explicit column count; when omitted, inferred from computed grid style. */
   columns?: number;
+  /** Called when the user presses "?" inside the grid to open help. */
+  onOpenHelp?: () => void;
 }
 
 function readCards(container: HTMLElement): {
@@ -73,12 +77,14 @@ function columnsFromContainer(
 
 /**
  * Arrow-key / Home / End roving focus across `[data-market-card]` descendants.
- * Enter / Space activates the card's primary control.
+ * Enter / Space activates the card's primary control. "?" opens keyboard help.
  */
 export function useMarketCardGridKeyboard(
   containerRef: RefObject<HTMLElement | null>,
   options: UseMarketCardGridKeyboardOptions = {},
 ): void {
+  const { onOpenHelp } = options;
+
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
@@ -89,13 +95,20 @@ export function useMarketCardGridKeyboard(
       if (!container.contains(target)) return;
 
       // Ignore when typing in inputs / contenteditable inside the grid chrome.
-      const tag = target.tagName;
+      if (isTypingTarget(target)) return;
+
+      // "?" opens the keyboard-shortcuts help from anywhere inside the grid.
       if (
-        tag === "INPUT" ||
-        tag === "TEXTAREA" ||
-        tag === "SELECT" ||
-        target.isContentEditable
+        onOpenHelp &&
+        shouldOpenKeyboardHelp(event.key, target, {
+          altKey: event.altKey,
+          ctrlKey: event.ctrlKey,
+          metaKey: event.metaKey,
+        })
       ) {
+        event.preventDefault();
+        event.stopPropagation();
+        onOpenHelp();
         return;
       }
 
@@ -137,5 +150,5 @@ export function useMarketCardGridKeyboard(
 
     container.addEventListener("keydown", onKeyDown);
     return () => container.removeEventListener("keydown", onKeyDown);
-  }, [containerRef, options.columns]);
+  }, [containerRef, options.columns, onOpenHelp]);
 }

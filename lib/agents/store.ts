@@ -7,10 +7,13 @@ declare global {
   var __mimirAgentRecords: Map<string, AgentRecord> | undefined;
   // eslint-disable-next-line no-var
   var __mimirAgentResponses: Map<string, { body: unknown; status: number }> | undefined;
+  // eslint-disable-next-line no-var
+  var __mimirResearchBudgets: Map<string, number> | undefined;
 }
 
 const records = globalThis.__mimirAgentRecords ??= new Map<string, AgentRecord>();
 const responses = globalThis.__mimirAgentResponses ??= new Map();
+const budgets = globalThis.__mimirResearchBudgets ??= new Map<string, number>();
 const responseKey = (agentId: string, action: string, key: string) => `${agentId}:${action}:${key}`;
 
 export async function saveAgent(agent: AgentRecord): Promise<void> {
@@ -57,4 +60,16 @@ export async function loadIdempotentResponse(agentId: string, action: string, ke
 export async function saveIdempotentResponse(agentId: string, action: string, key: string, body: unknown, status = 200) {
   responses.set(responseKey(agentId, action, key), { body, status });
   await saveAgentApiResponse({ agentId, action, idempotencyKey: key, body, status, createdAt: Date.now() }).catch(() => undefined);
+}
+
+export function getResearchBudgetUsage(agentId: string): number {
+  return budgets.get(agentId) ?? 0;
+}
+
+export function setResearchBudgetUsage(agentId: string, used: number): void {
+  budgets.set(agentId, used);
+}
+
+export function resetResearchBudgets(): void {
+  budgets.clear();
 }

@@ -174,8 +174,27 @@ impl MimirSquad {
         storage::pending_oracle(&env)
     }
 
+    /// Queue a fee recipient rotation; the current fee recipient must authorize.
+    pub fn queue_fee_recipient(env: Env, new_recipient: Address) -> Result<(), Error> {
+        pool::queue_fee_recipient(&env, new_recipient)
+    }
+
+    /// Drop a queued fee recipient rotation; the current fee recipient must authorize.
+    pub fn cancel_fee_recipient(env: Env) -> Result<(), Error> {
+        pool::cancel_fee_recipient(&env)
+    }
+
+    /// Apply a queued fee recipient rotation once its timelock has elapsed.
+    pub fn execute_fee_recipient(env: Env) -> Result<(), Error> {
+        pool::execute_fee_recipient(&env)
+    }
+
     pub fn get_fee_recipient(env: Env) -> Result<Address, Error> {
         storage::fee_recipient(&env)
+    }
+
+    pub fn get_pending_fee_recipient(env: Env) -> Option<Address> {
+        storage::pending_fee_recipient(&env)
     }
 
     pub fn get_escrow_balance(env: Env) -> Result<i128, Error> {

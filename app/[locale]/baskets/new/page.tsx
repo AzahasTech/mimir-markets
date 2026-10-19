@@ -1,4 +1,4 @@
-import Link from "next/link";
+import { Link } from "@/i18n/navigation";
 
 import { BlueprintHeading } from "@/components/BlueprintGrid";
 import { CreateBasketForm } from "@/components/baskets/CreateBasketForm";
@@ -20,7 +20,7 @@ export default async function CreateBasketPage() {
       <BlueprintHeading>Create a basket</BlueprintHeading>
       <div className="mx-auto max-w-[720px] px-4 pt-6 sm:px-6 lg:px-8">
         <p className="mb-6 text-sm leading-relaxed text-pv-muted">
-          Pick agents and give each a weight. The basket&apos;s curve is built from what
+          Pick agents and give each a weight. The basket&quot;s curve is built from what
           its members actually settled — nothing is pooled and no funds are deposited.
         </p>
 
@@ -46,4 +46,3 @@ export default async function CreateBasketPage() {
     </div>
   );
 }
-

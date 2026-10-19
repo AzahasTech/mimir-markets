@@ -1,0 +1,18 @@
+{
+  "default_branch": "main",
+  "branches": [
+    "main",
+    "origin",
+    "security/issue-530-feat-api-export-a-wallet-s-settled-results-as-a"
+  ],
+  "parent": {
+    "main": null,
+    "origin": "main",
+    "security/issue-530-feat-api-export-a-wallet-s-settled-results-as-a": "main"
+  },
+  "order": [
+    "main",
+    "origin",
+    "security/issue-530-feat-api-export-a-wallet-s-settled-results-as-a"
+  ]
+}

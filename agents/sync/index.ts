@@ -20,7 +20,7 @@
  */
 
 import { getMarketContractId, getStellarRpcUrl } from "../../lib/stellar";
-import { reportingPoll } from "../../lib/ops/heartbeat";
+import { reportingPoll, runWorkerLoop } from "../../lib/ops/heartbeat";
 import { reconcileSettlements } from "../../lib/server/settlement-index";
 import { reconcileVsIndex } from "../../lib/server/vs-index";
 import {
@@ -89,8 +89,11 @@ async function main(): Promise<void> {
   // failing on /api/health rather than merely stale.
   const safePoll = () => reportingPoll("sync", "sync", POLL_INTERVAL_MS / 1000, poll);
 
-  await safePoll();
-  setInterval(safePoll, POLL_INTERVAL_MS);
+  await runWorkerLoop({
+    worker: "sync",
+    intervalMs: POLL_INTERVAL_MS,
+    cycle: safePoll,
+  });
 }
 
 main().catch((err) => {

@@ -16,8 +16,15 @@ type RefreshBody = {
 };
 
 export async function POST(request: Request) {
+  let payload: RefreshBody;
   try {
-    const payload = (await request.json()) as RefreshBody;
+    payload = (await request.json()) as RefreshBody;
+  } catch {
+    const err = apiError("invalid_request", "invalid JSON");
+    return NextResponse.json(err.body, { status: err.status, headers: err.headers });
+  }
+
+  try {
     const claimId = parsePositiveIntegerParam(
       payload.claimId == null ? undefined : String(payload.claimId)
     );

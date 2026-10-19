@@ -2,11 +2,11 @@
  * Edad del snapshot para copy de UI (relativo, locale-aware).
  *
  * Contrato:
- * - `ageMs` debe ser un número finito y no negativo; en caso contrario se
- *   devuelve cadena vacía (estado inválido/desconocido).
- * - `locale` debe ser un locale BCP 47 válido; si `Intl` no puede resolverlo
- *   se cae a `"en"` para no romper el render (dependencia tolerante a fallos).
- * - El resultado es siempre una cadena no vacía para entradas válidas, de
+ * - `ageMs` debe ser un numero finito y no negativo; en caso contrario se
+ *   devuelve cadena vacia (estado invalido/desconocido).
+ * - `locale` debe ser un locale BCP 47 valido; si `Intl` no puede resolverlo
+ *   se cae a "en" para no romper el render (dependencia tolerante a fallos).
+ * - El resultado es siempre una cadena no vacia para entradas validas, de
  *   modo que la UI pueda mostrar feedback estable sin parpadeos.
  */
 export function formatDashboardSnapshotAge(
