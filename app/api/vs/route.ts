@@ -6,6 +6,31 @@ import { VS_CACHE_HEADERS } from "@/lib/server/vs-cache";
 
 export const dynamic = "force-dynamic";
 
+export function computeVsEtag(updatedAt: string | number | null | undefined, count: number): string {
+  const maxUpdatedAt = updatedAt == null ? "0" : String(updatedAt);
+  return `W/"${maxUpdatedAt}-${count}"`;
+}
+
+export function isEtagMatch(ifNoneMatch: string | null, ifNoneMatchWeak: string | null, etag: string): boolean {
+  const header = ifNoneMatch ?? ifNoneMatchWeak;
+  if (!header) return false;
+  const tokens = header.split(",").map((t) => t.trim());
+  if (tokens.includes("*")) return true;
+  const normalize = (value: string) => value.replace(/^W\//, "");
+  const target = normalize(etag);
+  return tokens.some((t) => normalize(t) === target);
+}
+
+function resolveMaxUpdatedAt(items: Array<Record<string, unknown>>): string | number | null {
+  let max: string | number | null = null;
+  for (const item of items) {
+    const value = item.updated_at as string | number | null | undefined;
+    if (value == null) continue;
+    if (max === null || value > max) max = value;
+  }
+  return max;
+}
+
 export async function GET(request: Request) {
   try {
     const { authorizeRequest } = await import("@/lib/api/policy");
@@ -43,6 +68,17 @@ export async function GET(request: Request) {
       limit,
     });
 
+    const maxUpdatedAt = resolveMaxUpdatedAt(items as Array<Record<string, unknown>>);
+    const etag = computeVsEtag(maxUpdatedAt, items.length);
+    const ifNoneMatch = request.headers.get("if-none-match");
+
+    if (isETagMatch(ifNoneMatch, null, etag)) {
+      return new NextResponse(null, {
+        status: 304,
+        headers: { ...VS_CACHE_HEADERS, ETag: etag },
+      });
+    }
+
     return NextResponse.json(
       {
         items,
@@ -51,7 +87,7 @@ export async function GET(request: Request) {
         nextCursor,
       },
       {
-        headers: VS_CACHE_HEADERS,
+        headers: { ...VS_CACHE_HEADERS, ETag: etag },
       }
     );
   } catch {

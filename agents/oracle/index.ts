@@ -72,6 +72,7 @@ import {
   BPS_DIVISOR,
   challengeClaim,
   getClaimCount,
+  readClaimsBatch,
   readClaimRaw,
   resolveClaim,
   type ClaimData,
@@ -87,7 +88,7 @@ import {
   requireMarketContractId,
 } from "../../lib/stellar";
 import { fetchWithBudget, payingWalletFor } from "../../lib/x402/buyer";
-import { reportingPoll } from "../../lib/ops/heartbeat";
+import { reportingPoll, runWorkerLoop } from "../../lib/ops/heartbeat";
 import { isPaused, pauseState } from "../../lib/ops/flags";
 import {
   DependencyFailureError,
@@ -103,6 +104,7 @@ import {
   type SettlementErrorInfo,
   type SettlementRetryConfig,
 } from "../../lib/settlement-retry";
+import { classifyClaimsForOracle } from "../../lib/oracle/classify-claims";
 // Explicit settlement outcome + named UNRESOLVABLE (refund) reasons (#99).
 import { applySettlementPolicy, describeDecision } from "../../lib/oracle/unresolvable-policy";
 import { unitsToUsdc, usdcToUnits, formatAtomicUsdc } from "../../lib/usdc";
@@ -125,6 +127,7 @@ import {
 import { normalizeQuorum } from "../../lib/council/quorum";
 // Confidence tiers + fetcher-trust cap: pure and fixture-calibrated (#97).
 import { applyFetcherTrust, tierVerdict } from "../../lib/oracle/confidence-tiers";
+import { evaluateClaim as evaluateClaimPure, type EvaluateClaimDeps } from "./evaluate";
 import { RiskManager } from "../../lib/oracle-risk";
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -844,37 +847,44 @@ async function poll(): Promise<void> {
 
   console.log(`\n[oracle] ── Poll at ${new Date().toISOString()} ── ${total} claims`);
 
+  // Batched reads: one RPC round-trip per BATCH_SIZE claims instead of one per
+  // claim. Classification is pure (see classifyClaimsForOracle) so the results
+  // are identical to the previous per-id loop for the same chain state.
+  const BATCH_SIZE = 50;
+  const claims: ClaimOnChain[] = [];
+  for (let start = 1; start <= total; start += BATCH_SIZE) {
+    const ids: number[] = [];
+    for (let id = start; id < start + BATCH_SIZE && id <= total; id++) ids.push(id);
+    const batch = await readClaimsBatch(ids);
+    for (const claim of batch) {
+      if (claim) claims.push(claim);
+    }
+  }
+
+  const { expiredActive, challengeable } = classifyClaimsForOracle(claims, now);
+
   const settled: number[]   = [];
   const challenged: number[] = [];
-  const expiredActive: ClaimOnChain[] = [];
 
-  for (let id = 1; id <= total; id++) {
-    const claim = await fetchClaim(id);
-    if (!claim) continue;
-    if (claim.state === "active" && claim.deadline <= now) {
-      expiredActive.push(claim);
-      continue;
-    }
+  // Release risk slots for anything no longer live (resolved/cancelled/etc.).
+  for (const claim of claims) {
     if (claim.state !== "open" && claim.state !== "active") {
       riskManager.release(claim.id);
     }
+  }
 
+  for (const claim of challengeable) {
     try {
       // Challenge mispriced claims while the challenge window is open.
       // The contract allows up to `max_challengers` per claim, so ACTIVE claims
       // are still joinable — the duplicate-stake check happens inside the helper.
-      if (
-        (claim.state === "open" || claim.state === "active") &&
-        claim.deadline > now
-      ) {
-        const before = challengedClaimIds.size;
-        await withBackoff("oracle", () => challengeIfMispriced(claim), {
-          policy: ORACLE_BACKOFF,
-        });
-        if (challengedClaimIds.size > before) challenged.push(id);
-      }
+      const before = challengedClaimIds.size;
+      await withBackoff("oracle", () => challengeIfMispriced(claim), {
+        policy: ORACLE_BACKOFF,
+      });
+      if (challengedClaimIds.size > before) challenged.push(claim.id);
     } catch (err) {
-      console.error(`[oracle] Error on claim ${id}:`, err);
+      console.error(`[oracle] Error on claim ${claim.id}:`, err);
     }
   }
 
@@ -949,8 +959,7 @@ async function main(): Promise<void> {
   // failing on /api/health rather than merely stale.
   const safePoll = () => reportingPoll("oracle", "oracle", POLL_INTERVAL_MS / 1000, poll);
 
-  await safePoll();
-  setInterval(safePoll, POLL_INTERVAL_MS);
+  await runWorkerLoop({ worker: "oracle", intervalMs: POLL_INTERVAL_MS, cycle: safePoll });
 }
 
 main().catch((err) => {

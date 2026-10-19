@@ -65,7 +65,7 @@ pub fn resolve_claim_versioned(
     let mut claim = storage::get_claim(env, claim_id)?;
     if claim.state == ClaimState::Resolved {
         // Idempotent replay: same decoded verdict and inputs is a no-op.
-        if verdict.decode().ok() == Some(claim.winner_side)
+        if winner_side == claim.winner_side
             && claim.resolution_summary == summary
             && claim.confidence == confidence
             && claim.evidence_hash == Some(evidence_hash.clone())

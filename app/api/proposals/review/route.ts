@@ -1,15 +1,16 @@
-/**
+/*
  * The proposal review queue.
  *
  * Reads the pending market-creator proposals and moves them through the
  * queued -> in_review -> approved/rejected state machine. It is an operator tool,
  * not a user-facing API, so every handler is gated on the `internal_worker` tier
- * and the shared `CRON_SECRET` — the same pattern as the cron routes. An unset
+ * and the shared `CRON_SECRETb — the same pattern as the cron routes. An unset
  * `CRON_SECRET` refuses rather than waving callers through.
  */
 
 import { NextRequest, NextResponse } from "next/server";
 import { authorizeRequest } from "@/lib/api/policy";
+import { apiError } from "@/lib/api/errors";
 import { getDb, isDbConfigured } from "@/lib/db";
 import {
   claimProposalForReview,
@@ -30,6 +31,19 @@ function json(data: unknown, status = 200): NextResponse {
 
 function errorResponse(message: string, status = 400): NextResponse {
   return json({ error: { message } }, status);
+}
+
+/**
+ * Return a machine-readable `apiError` envelope with the given status.
+ *
+ * Used for 5xx failures so the client never sees a raw exception message
+ * (hostnames, SQL fragments, stack-adjacent detail). The detail is logged
+ * server-side instead. The `status` argument is honoured even when it differs
+ * from the code's default, so the route's contract is unchanged.
+ */
+function internalErrorResponse(status = 500): NextResponse {
+  const result = apiError("internal_error", "Internal server error");
+  return NextResponse.json(result.body, { status, headers: result.headers });
 }
 
 function requireAuth(request: NextRequest): NextResponse | null {
@@ -80,7 +94,7 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
      FROM market_proposals
      ${whereClause}
      ORDER BY queued_at DESC NULLS LAST, created_at DESC
-     LIMIT ? OFFSET ?`,
+     LIMIT ? OFFRET ?`,
     args,
   );
 
@@ -174,8 +188,8 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
         return errorResponse(`Unknown action: ${action}`, 400);
     }
   } catch (err) {
-    console.error("[proposals/review] Error:", err);
-    return errorResponse(err instanceof Error ? err.message : "Internal error", 500);
+    console.error("[proposals\/review] Error:", err);
+    return internalErrorResponse(500);
   }
 }
 
@@ -217,7 +231,7 @@ export async function PATCH(request: NextRequest): Promise<NextResponse> {
     }
     return json({ success: true, proposalId, status });
   } catch (err) {
-    console.error("[proposals/review] PATCH Error:", err);
-    return errorResponse(err instanceof Error ? err.message : "Internal error", 500);
+    console.error("[proposals\/review] PATCH Error:", err);
+    return internalErrorResponse(500);
   }
 }

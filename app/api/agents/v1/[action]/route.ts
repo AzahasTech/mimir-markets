@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { withRequestId } from "@/lib/api/errors";
 import { verifyAgentSignature } from "@/lib/agents/signature";
 import { isStellarAccount } from "@/lib/stellar-message";
 import { getUserVKDFrom } from "@/lib/contract";
@@ -42,6 +43,7 @@ import { validateAgentApiRequest, schemaVersionHeaders } from "@/lib/api/schema"
 import { gateOrPause, pausedCapabilityError, getCapabilityPauseDetail } from "@/lib/server/pause-registry";
 import { apiError } from "@/lib/api/errors";
 import { tracedRoute } from "@/lib/ops/trace-http";
+import { fetchResearch, BudgetExhaustedError } from "@/lib/research/gateway";
 
 export const dynamic = "force-dynamic";
 
@@ -64,8 +66,6 @@ function normalizeWallet(value: string): string {
 function json(body: unknown, status = 200): Response {
   return Response.json(body, { status, headers: { "cache-control": "no-store", ...schemaVersionHeaders() } });
 }
-
-import { withRequestId } from "@/lib/api/errors";
 
 /** Convert a structured ApiErrorResult from lib/api/errors into a Response. */
 /** Map an authorizeAction() rejection to the typed agent API error envelope. */
@@ -208,6 +208,400 @@ async function register(request: SignedAgentRequest<Record<string, any>>): Promi
   return json(payload);
 }
 
-export const POST = trackedRoute(async (req: Request): Promise<Response> => {
-  return json({ error: { message: "not implemented" } }, 501);
-});
+function clientIp(req: Request): string | undefined {
+  const forwarded = req.headers.get("x-forwarded-for");
+  return forwarded?.split(",")[0]?.trim() || req.headers.get("x-real-ip") || undefined;
+}
+
+async function handleAgentApiPost(
+  req: Request,
+  context: { params: Promise<{ action: string }> },
+): Promise<Response> {
+  const { action: rawAction } = await context.params;
+  // Correlates the early rejections below, which happen before an agent is known.
+  const requestId = randomUUID();
+  if (!(AGENT_API_ACTIONS as readonly string[]).includes(rawAction)) {
+    return errorResponse(withRequestId(apiError("not_found", "unknown action"), requestId));
+  }
+  const action = rawAction as AgentApiAction;
+  // Cap before parse: Content-Length is a cheap fail-closed gate; the body byte
+  // check below still applies when the header is absent or wrong.
+  const declared = Number(req.headers.get("content-length") ?? NaN);
+  if (Number.isFinite(declared) && declared > MAX_SIGNED_REQUEST_PAYLOAD_BYTES) {
+    return json({
+      error: { message: `payload exceeds ${MAX_SIGNED_REQUEST_PAYLOAD_BYTES} bytes`, requestId },
+    }, 413);
+  }
+  let raw: string;
+  try { raw = await req.text(); }
+  catch { return json({ error: { message: "invalid body" } }, 400); }
+  if (new TextEncoder().encode(raw).length > MAX_SIGNED_REQUEST_PAYLOAD_BYTES) {
+    return json({
+      error: { message: `payload exceeds ${MAX_SIGNED_REQUEST_PAYLOAD_BYTES} bytes` },
+    }, 413);
+  }
+  let request: SignedAgentRequest;
+  try { request = JSON.parse(raw) as SignedAgentRequest; }
+  catch { return json({ error: { message: "invalid JSON" } }, 400); }
+
+  // An API-key caller writes plain HTTP: `{ "body": {...} }` with the action in the
+  // path. Everything the signed envelope carries for its own sake — version, nonce,
+  // timestamp — is filled in here rather than demanded of them.
+  const auth = await authenticateAgentRequest({
+    action,
+    authorization: req.headers.get("authorization"),
+    ip: clientIp(req),
+    claimedAgentId: typeof request.agentId === "string" && request.agentId ? request.agentId : undefined,
+  });
+  if (auth.error) return Response.json(auth.error.body, { status: auth.error.status, headers: { ...auth.error.headers, "cache-control": "no-store", ...schemaVersionHeaders() } });
+  const viaApiKey = auth.auth?.kind === "api_key";
+
+  if (viaApiKey && auth.auth?.kind === "api_key") {
+    request = {
+      ...request,
+      version: AGENT_API_VERSION,
+      action,
+      agentId: auth.auth.agentId,
+      idempotencyKey: request.idempotencyKey || randomUUID(),
+      nonce: request.nonce || randomUUID(),
+      signedAt: Date.now(),
+      // Placeholder for the API-key path, where the envelope is not the
+      // credential and `validateAgentRequestEnvelope` is told not to require a
+      // signature. Base64-shaped rather than `0x`-shaped so it cannot be mistaken
+      // for a real Ed25519 signature in an audit row.
+      signature: request.signature ?? "",
+      body: request.body ?? {},
+    };
+  }
+
+  if (request.action !== action) return json({ error: { message: "action/path mismatch" } }, 400);
+  const envelopeErrors = validateAgentRequestEnvelope(request, Date.now(), { requireSignature: !viaApiKey });
+  if (envelopeErrors.length) return json({ error: { message: envelopeErrors.join("; ") } }, 400);
+
+  // Drift check: validate the request body shape against the schema spec.
+  const shapeResult = validateAgentApiRequest(request);
+  if (!shapeResult.ok) {
+    return json({ error: { message: "schema validation failed", details: shapeResult.errors } }, 400);
+  }
+  if (shapeResult.unexpected.length > 0) {
+    return json({ error: { message: "unexpected fields in request", details: shapeResult.unexpected } }, 400);
+  }
+
+  if (action === "register") return register(request as SignedAgentRequest<Record<string, any>>);
+
+  const agent = await loadAgent(request.agentId);
+  if (!agent) return json({ error: { message: "agent not found" } }, 404);
+  if (!viaApiKey) {
+    const signer = requiresOwnerSignature(action) ? agent.ownerWallet : agent.operatorWallet;
+    if (!(await verify(signer, agentRequestMessage(request), request.signature))) {
+      await audit(request, "rejected", "signature");
+      return json({ error: { message: "signature rejected" } }, 401);
+    }
+    const { authorizeRequest } = await import("@/lib/api/policy");
+    const gate = authorizeRequest("registered_agent", {
+      route: `/api/agents/v1/${action}`,
+      wallet: signer,
+      agentId: agent.agentId,
+      signatureVerified: true,
+      ip: clientIp(req),
+    });
+    if (!gate.allowed && gate.error) {
+      await audit(request, "rejected", "rate_limited");
+      return errorResponse(gate.error);
+    }
+  }
+  // A revoked agent keeps read access to its own records but does nothing else;
+  // that is what makes revoke a usable emergency stop rather than a data loss.
+  if (agent.status === "revoked" && !["heartbeat", "listPositions", "listEarnings", "listKeys", "spendStatus"].includes(action)) {
+    await audit(request, "rejected", "agent_revoked");
+    return json({ error: { message: "agent is revoked" } }, 403);
+  }
+  if (FUNDED_ACTIONS.includes(action) && !isFeatureEnabled("byoa_funded_actions")) {
+    await audit(request, "rejected", "feature_disabled");
+    return json({
+      error: {
+        message: "byoa funded actions are not enabled",
+        detail: "dryRun and proposeMarket work meanwhile; they move no money.",
+      },
+    }, 403);
+  }
+  // After the feature check, as in checkWriteAllowed: "not enabled" is the truer
+  // answer for something that was never switched on. Before the idempotency replay,
+  // so a cached "allowed" cannot be served while the capability is paused.
+  const pauseCapability = AGENT_ACTION_PAUSE[action];
+  const pauseErr = pauseCapability ? gateOrPause({ capability: pauseCapability }) : null;
+  if (pauseErr) {
+    await audit(request, "rejected", "paused");
+    return errorResponse(pauseErr);
+  }
+  const prior = await loadIdempotentResponse(agent.agentId, action, request.idempotencyKey);
+  if (prior) return json(prior.body, prior.status);
+  const replayed = await rejectReplayedSignedEnvelope({
+    agentId: agent.agentId,
+    nonce: request.nonce,
+    signedAt: request.signedAt,
+  });
+  if (replayed) {
+    await audit(request, "rejected", "nonce_replay");
+    return errorResponse(replayed);
+  }
+
+  const body = (request.body ?? {}) as Record<string, any>;
+  let result: unknown;
+  if (action === "issueKey") {
+    // Returned once. There is no endpoint that can show it again, which is the
+    // point: a key readable from the API is a key readable from a stolen session.
+    const key = generateApiKey(body.environment === "test" ? "test" : "live");
+    // Optional TTL in seconds. Absent means permanent (no expiry set).
+    let expiresAt: number | undefined;
+    if (body.ttl_seconds !== undefined && body.ttl_seconds !== null) {
+      const ttl = Number(body.ttl_seconds);
+      if (!Number.isFinite(ttl) || ttl <= 0) {
+        return json({ error: { message: "ttl_seconds must be a positive number" } }, 400);
+      }
+      expiresAt = Date.now() + Math.floor(ttl) * 1000;
+    }
+    const scopes = Array.isArray(body.scopes) ? body.scopes.map(String) : undefined;
+    if (scopes && scopes.length === 0) {
+      return json({ error: { message: "Cannot issue a key with an empty scope set" } }, 400);
+    }
+    const record: AgentApiKeyRecord = {
+      keyId: randomUUID(), agentId: agent.agentId, keyHash: hashApiKey(key),
+      keyPrefix: apiKeyPrefix(key), label: String(body.label ?? "").slice(0, 80),
+      createdAt: Date.now(), expiresAt, scopes,
+    };
+    await insertAgentApiKey(record);
+    result = {
+      apiKey: key, keyId: record.keyId, prefix: record.keyPrefix, label: record.label,
+      expiresAt: record.expiresAt ?? null,
+      note: "Store this now — it is not recoverable.",
+      usage: `Authorization: Bearer ${record.keyPrefix}...`,
+    };
+  } else if (action === "listKeys") {
+    const keys = await listAgentApiKeys(agent.agentId);
+    result = {
+      keys: keys.map((k) => ({
+        keyId: k.keyId, prefix: k.keyPrefix, label: k.label, createdAt: k.createdAt,
+        lastUsedAt: k.lastUsedAt ?? null, expiresAt: k.expiresAt ?? null,
+        revokedAt: k.revokedAt ?? null,
+      })),
+    };
+  } else if (action === "revokeKey") {
+    const keyId = String(body.keyId ?? "");
+    if (!keyId) return json({ error: { message: "keyId is required" } }, 400);
+    const revoked = await revokeAgentApiKey(agent.agentId, keyId, Date.now(), String(body.reason ?? "owner revoked"));
+    if (!revoked) return json({ error: { message: "key not found or already revoked" } }, 404);
+    result = { keyId, revoked: true };
+  } else if (action === "rotateKey") {
+    // rotateKey is OWNER_SIGNED (same as issueKey/revokeKey): a key cannot
+    // authorize the rotation that retires it or mints its successor.
+    //
+    // Flow:
+    //   1. Validate the old keyId and overlap window.
+    //   2. Issue a fresh key and persist it.
+    //   3. Schedule the old key's expiry at now + overlap_ms.
+    //
+    // The old key keeps working through the overlap window so any running
+    // service that already has it can keep authenticating while the operator
+    // distributes the new credential. After the window closes, the old key
+    // silently returns "expired" from checkApiKeyRecord.
+    const keyId = String(body.keyId ?? "");
+    if (!keyId) return json({ error: { message: "keyId is required" } }, 400);
+
+    const overlapResult = parseOverlapMs(body.overlap_ms);
+    if (!overlapResult.ok) {
+      return json({ error: { message: overlapResult.error } }, 400);
+    }
+    const { overlapMs } = overlapResult;
+
+    // Issue the new key first — if the DB is unavailable we do nothing rather
+    // than scheduling an expiry on the old key without a replacement.
+    const newKey = generateApiKey(body.environment === "test" ? "test" : "live");
+    const scopes = Array.isArray(body.scopes) ? body.scopes.map(String) : undefined;
+    if (scopes && scopes.length === 0) {
+      return json({ error: { message: "Cannot issue a key with an empty scope set" } }, 400);
+    }
+    const newRecord: AgentApiKeyRecord = {
+      keyId: randomUUID(), agentId: agent.agentId, keyHash: hashApiKey(newKey),
+      keyPrefix: apiKeyPrefix(newKey), label: String(body.label ?? "").slice(0, 80),
+      createdAt: Date.now(), scopes,
+    };
+    await insertAgentApiKey(newRecord);
+
+    // Schedule the outgoing key's expiry. If the old keyId is not found (already
+    // revoked or belongs to a different agent), treat it as a non-fatal warning:
+    // the caller still gets a new key, and revocation already provides a stronger
+    // stop than expiry would have.
+    const now = Date.now();
+    const expiresAt = now + overlapMs;
+    const scheduled = await setAgentApiKeyExpiry(agent.agentId, keyId, expiresAt);
+
+    result = {
+      // New credential — store it now, it is not recoverable.
+      apiKey: newKey, keyId: newRecord.keyId, prefix: newRecord.keyPrefix, label: newRecord.label,
+      note: "Store this now — it is not recoverable.",
+      usage: `Authorization: Bearer ${newRecord.keyPrefix}...`,
+      // Outgoing key status.
+      rotated: {
+        keyId,
+        expiresAt: scheduled ? expiresAt : null,
+        overlapMs,
+        warning: scheduled ? undefined : "old key not found or already revoked; no expiry scheduled",
+      },
+    };
+  } else if (action === "grantSpend") {
+    const parsed = parseSpendPermissionGrant({
+      agentId: agent.agentId, grant: body as SpendPermissionGrant,
+      spender: configuredSpender(), now: Date.now(),
+    });
+    if (!parsed.ok) return json({ error: { message: parsed.error } }, 400);
+    // The owner's own account must be the source of funds; letting an agent point a
+    // permission at a third party's account would make this a phishing endpoint.
+    // EXACT comparison — see `normalizeWallet` above.
+    if (parsed.record.account !== agent.ownerWallet.trim()) {
+      return json({ error: { message: "permission account must be the agent owner wallet" } }, 403);
+    }
+    await upsertSpendPermission(parsed.record);
+    result = {
+      permissionHash: parsed.record.permissionHash,
+      allowanceAtomic: parsed.record.allowanceAtomic.toString(),
+      periodSeconds: parsed.record.periodSeconds,
+      startAt: parsed.record.startAt, endAt: parsed.record.endAt,
+    };
+  } else if (action === "revokeSpend") {
+    const hash = String(body.permissionHash ?? "");
+    if (!hash) return json({ error: { message: "permissionHash is required" } }, 400);
+    const revoked = await revokeSpendPermission(agent.agentId, hash, Date.now(), String(body.reason ?? "owner revoked"));
+    if (!revoked) return json({ error: { message: "permission not found or already revoked" } }, 404);
+    // On-chain revocation is the owner's own call and outranks this record; this only
+    // stops Mimir from drawing further.
+    result = { permissionHash: hash, revoked: true, note: "Mimir will draw no further; revoke on chain to withdraw the grant itself." };
+  } else if (action === "spendStatus") {
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    const permission = await getActiveSpendPermission(agent.agentId, nowSeconds);
+    if (!permission) result = { funded: false, reason: "no active spend permission" };
+    else {
+      const periodStart = currentPeriodStart(permission, nowSeconds);
+      const spent = await getSpentInPeriod(permission.permissionHash, periodStart);
+      const decision = evaluateSpend({
+        permission, spentThisPeriodAtomic: spent, amountAtomic: 0n,
+        nowSeconds, spender: configuredSpender(),
+      });
+      result = {
+        funded: true,
+        permissionHash: permission.permissionHash,
+        account: permission.account,
+        allowanceAtomic: permission.allowanceAtomic.toString(),
+        spentThisPeriodAtomic: spent.toString(),
+        remainingAtomic: decision.remainingAtomic.toString(),
+        periodStart, periodEndsAt: decision.periodEndsAt, endAt: permission.endAt,
+        limits: agent.limits,
+      };
+    }
+  } else if (action === "heartbeat") result = { agentId: agent.agentId, status: agent.status, at: Date.now() };
+  else if (action === "listPositions") result = { positions: await getUserVSDirect(agent.operatorWallet) };
+  else if (action === "listEarnings") {
+    const earnings = await getAgentEarningsSummary(agent.payoutWallet).catch(() => ({ ownerFeesAtomic: 0n, unclaimedAtomic: 0n, x402Atomic: 0n }));
+    result = { payoutWallet: agent.payoutWallet, ownerFeesAtomic: earnings.ownerFeesAtomic.toString(),
+      unclaimedAtomic: earnings.unclaimedAtomic.toString(), x402Atomic: earnings.x402Atomic.toString() };
+  }
+  else if (action === "revoke") {
+    // revoke is in OWNER_SIGNED_ACTIONS, so reaching here means the owner's own
+    // signature verified above — an API key is refused before this point.
+    const revoked = revokeAgent(agent, { requestedBy: agent.ownerWallet, reason: String(body.reason ?? "owner revoked") });
+    if (!revoked.ok) return json({ error: { message: revoked.reason } }, 403);
+    await saveAgent(revoked.agent); result = { agent: revoked.agent };
+  } else if (action === "publishReasoning") {
+    const gate = authorizeAction(agent, { capability: "researcher", requestsThisHour: Number(body.requestsThisHour ?? 0) });
+    if (!gate.allowed) {
+      await audit(request, "rejected", gate.reason);
+      return errorResponse(actionVerdictToError(gate, "researcher"));
+    }
+    result = await publishReasoning({ ...(body as any), agentId: agent.agentId });
+  } else if (action === "fetchResearch") {
+    const gate = authorizeAction(agent, { capability: "researcher", requestsThisHour: Number(body.requestsThisHour ?? 0) });
+    if (!gate.allowed) {
+      await audit(request, "rejected", gate.reason);
+      return errorResponse(actionVerdictToError(gate, "researcher"));
+    }
+    try {
+      result = await fetchResearch({ ...(body as any), agentId: agent.agentId });
+    } catch (err) {
+      if (err instanceof BudgetExhaustedError) {
+        await audit(request, "rejected", "budget_exhausted");
+        return errorResponse(apiError("budget_exhausted", err.message));
+      }
+      throw err;
+    }
+  } else {
+    const capability: AgentCapability = action === "proposeMarket" || action === "createMarket" || action === "dryRun"
+      ? "market_creator" : "council_juror";
+    const proposalOnly = action === "proposeMarket";
+    const gate = authorizeAction(agent, {
+      capability, category: body.category, settlementMode: body.settlementMode,
+      positionAtomic: parseUsdcAtomic(String(body.positionUsdc ?? body.stakeUsdc ?? 0)).toString(),
+      exposureTodayAtomic: parseUsdcAtomic(String(body.exposureTodayUsdc ?? 0)).toString(),
+      activeMarkets: Number(body.activeMarkets ?? 0), requestsThisHour: Number(body.requestsThisHour ?? 0),
+      proposalOnly,
+    } as any);
+    if (!gate.allowed) return json({ error: { message: gate.reason, detail: gate.detail } }, 403);
+    if (action === "dryRun") {
+      // ── What "allowance" means now ──────────────────────────────────────────
+      // The EVM version read the ERC-20 allowance the agent had granted the
+      // market contract, because a stake could not land without one. Soroban has
+      // no standing allowance on this path: `challenge_claim` carries auth for
+      // exactly the staked amount, so there is nothing to pre-approve and an
+      // allowance read would always be zero and always look like a blocker.
+      //
+      // The question the dry run is actually asking — "would this stake go
+      // through?" — is now answered by the agent's own USDC BALANCE, so that is
+      // what is reported. Null (no trustline) is deliberately surfaced as zero:
+      // an account with no trustline genuinely cannot stake.
+      let spendable = 0n;
+      if (isMarketConfigured()) {
+        try {
+          spendable = (await getUsdcBalanceUnits(agent.operatorWallet)) ?? 0n;
+        } catch { /* report zero; dry-run stays safe */ }
+      }
+      result = buildAgentDryRun({
+        principalUsdc: Number(body.principalUsdc ?? body.stakeUsdc ?? 0),
+        grossPayoutUsdc: Number(body.grossPayoutUsdc ?? body.stakeUsdc ?? 0),
+        outcome: body.outcome ?? "creator_wins", allowanceAtomic: spendable,
+        requiredAtomic: usdcToUnits(Number(body.stakeUsdc ?? body.positionUsdc ?? 0)),
+        platformFeeBps: Number(body.platformFeeBps ?? 0),
+        agentOwnerFeeBps: Number(body.agentOwnerFeeBps ?? 0),
+        platformRecipient: String(body.platformRecipient ?? agent.ownerWallet),
+        ownerRecipient: agent.payoutWallet, policy: gate,
+      });
+    } else result = action === "proposeMarket"
+      ? { disposition: "review", proposal: body, moderationRequired: true }
+      : {
+          allowed: true, simulated: false, contract: getMarketContractId(),
+          // Stellar has no numeric chain id. The network passphrase is the
+          // equivalent domain separator — it is what every Stellar signature is
+          // bound to at the protocol level — so it is what a caller needs in order
+          // to build a transaction this deployment will accept. The short name is
+          // sent alongside it because that is the readable half.
+          network: STELLAR_NETWORK,
+          networkPassphrase: NETWORK_PASSPHRASE,
+          requiresExternalWalletSignature: true,
+          contractConfigured: isMarketConfigured(),
+          // The contract freezes the fee recipient onto the claim at creation, so a
+          // market opened without one can never pay this agent's owner — however
+          // the policy changes later. Handed back explicitly so a caller cannot omit
+          // it by accident and silently forfeit its own revenue.
+          agentOwnerRecipient: agent.payoutWallet,
+          feeNote: `Pass agent_owner_recipient=${agent.payoutWallet} in CreateParams to earn the agent-owner fee on this market.`,
+          preview: { positionUsdc: Number(body.positionUsdc ?? body.stakeUsdc ?? 0) },
+        };
+  }
+  await audit(request, "accepted");
+  await saveIdempotentResponse(agent.agentId, action, request.idempotencyKey, result);
+  return json(result);
+}
+
+// Traced: this is the API an autonomous agent calls, and the failure it gets back
+// carries the id in its body (see `apiError`) and in the `x-mimir-trace-id`
+// header. A signature failure, a pause, and a 500 are all one grep away instead of
+// three log streams read by eye. See docs/TRACE_CORRELATION.md.
+export const POST = tracedRoute("api.agents.v1", handleAgentApiPost);

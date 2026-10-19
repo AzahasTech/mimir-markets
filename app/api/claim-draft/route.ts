@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 
 import { generateClaimDrafts } from "@/lib/server/source-claim-generator";
 import { apiError } from "@/lib/api/errors";
+import { authorizeRequest } from "@/lib/api/rate-limit";
 
 export const dynamic = "force-dynamic";
 
@@ -13,6 +14,12 @@ type ClaimDraftRequestBody = {
 export async function POST(request: Request) {
   if (process.env.NEXT_PUBLIC_FEATURE_SOURCE_DRAFTS !== "1") {
     const err = apiError("not_found", "Source drafting is not enabled");
+    return NextResponse.json(err.body, { status: err.status, headers: err.headers });
+  }
+
+  const auth = authorizeRequest("claim_draft", request);
+  if (!auth.ok) {
+    const err = auth.error;
     return NextResponse.json(err.body, { status: err.status, headers: err.headers });
   }
 
@@ -42,4 +49,3 @@ export async function POST(request: Request) {
     return NextResponse.json(err.body, { status: err.status, headers: err.headers });
   }
 }
-

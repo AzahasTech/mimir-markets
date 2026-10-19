@@ -55,7 +55,7 @@ import {
   requireMarketContractId,
 } from "../../lib/stellar";
 import { payingWalletFor } from "../../lib/x402/buyer";
-import { reportingPoll } from "../../lib/ops/heartbeat";
+import { reportingPoll, runWorkerLoop } from "../../lib/ops/heartbeat";
 import { isCategoryEnabled } from "../../lib/ops/flags";
 import { unitsToUsdc } from "../../lib/usdc";
 import { gatherCouncilPreflight } from "./council-preflight";
@@ -84,6 +84,7 @@ import {
   describeBackoffError,
   withBackoff,
 } from "../../lib/ops/backoff-policies";
+import { reconcileSettlements } from "../../lib/server/settlement-index";
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const CONTRACT_ID         = requireMarketContractId();
@@ -120,9 +121,50 @@ const MIN_QUALITY_SCORE   = 70; // 0-100
 // Proposal-only until shadow precision has been measured against human review.
 // Opt-in rather than opt-out: the default has to be the safe one.
 const SHADOW_MODE         = process.env.MARKET_CREATOR_AUTONOMOUS !== "1";
-const DEFAULT_MAX_CHALLENGERS = Number(process.env.MARKET_CREATOR_MAX_CHALLENGERS ?? "10");
 /** U+001F, so a proposal id cannot be forged by a question containing the joiner. */
 const UNIT_SEPARATOR = String.fromCharCode(0x1f);
+
+/**
+ * Upper bound for `max_challengers`, mirroring the contract's `MAX_CHALLENGERS`.
+ * The on-chain `create_claim` rejects anything above it, so a value past this
+ * would fail every create at runtime instead of at boot.
+ */
+export const CONTRACT_MAX_CHALLENGERS = 100;
+
+/**
+ * Parse `MARKET_CREATOR_MAX_CHALLENGERS` into a usable challenger cap.
+ *
+ * Exported so the boot-time validation can be unit tested without spinning up
+ * the worker. A malformed value must fail closed: silently falling back to the
+ * default would let a typo'd cap diverge from what the proposal queue records.
+ */
+export function parseMaxChallengers(
+  raw: string | undefined,
+): { ok: true; value: number } | { ok: false; error: string } {
+  const trimmed = (raw ?? "").trim();
+  const source = trimmed === "" ? "10" : trimmed;
+  const value = Number(source);
+  if (!Number.isInteger(value)) {
+    return {
+      ok: false,
+      error: `MARKET_CREATOR_MAX_CHALLENGERS must be an integer, got "${raw}"`,
+    };
+  }
+  if (value < 1 || value > CONTRACT_MAX_CHALLENGERS) {
+    return {
+      ok: false,
+      error:
+        `MARKET_CREATOR_MAX_CHALLENGERS must be between 1 and ` +
+        `${CONTRACT_MAX_CHALLENGERS} (contract MAX_CHALLENGERS), got ${value}`,
+    };
+  }
+  return { ok: true, value };
+}
+
+const _maxChallengers = parseMaxChallengers(process.env.MARKET_CREATOR_MAX_CHALLENGERS);
+if (!_maxChallengers.ok) {
+  throw new Error(`[market-creator] ${_maxChallengers.error}`);
+}
 const CRYPTO_MIN_THRESHOLD_RATIO = Number(process.env.CRYPTO_MIN_THRESHOLD_RATIO ?? "0.65");
 const CRYPTO_MAX_THRESHOLD_RATIO = Number(process.env.CRYPTO_MAX_THRESHOLD_RATIO ?? "1.35");
 const CREATE_DELAY_MS = Number(process.env.MARKET_CREATE_DELAY_MS ?? "600000");
@@ -839,7 +881,7 @@ async function createClaim(candidate: ClaimCandidate): Promise<string | null> {
       market_type:           candidate.marketType,
       odds_mode:             "pool",
       settlement_rule:       candidate.settlementRule,
-      max_challengers:       100,
+      max_challengers:       DEFAULT_MAX_CHALLENGERS,
       visibility:            "public",
       agent_owner_recipient: FEE_RECIPIENT,
     }), { policy: CREATOR_BACKOFF });
@@ -1284,6 +1326,7 @@ async function main(): Promise<void> {
   console.log(`  Stake/mkt  : ${CREATOR_STAKE_USDC} USDC`);
   console.log(`  Max/run    : ${MAX_CLAIMS_PER_RUN} claims`);
   console.log(`  Active cap : ${MAX_ACTIVE_CLAIMS} unresolved (skip run above this)`);
+  console.log(`  Challengers: ${DEFAULT_MAX_CHALLENGERS} per market (contract max ${CONTRACT_MAX_CHALLENGERS})`);
   console.log(`  Exposure   : ${MAX_OPEN_EXPOSURE_USDC} USDC open-creator ceiling`);
   console.log(`  Cat caps   : ${describeCategoryCapPolicy(CREATOR_POLICY.categoryCaps)}`);
   console.log(`  Preflight  : ${PREFLIGHT_ENABLED ? `on via ${PREFLIGHT_BASE_URL}` : "off"}`);
@@ -1297,8 +1340,11 @@ async function main(): Promise<void> {
       pause: "market_creator_worker",
     });
 
-  await safeRun();
-  setInterval(safeRun, RUN_INTERVAL_HOURS * 3600 * 1000);
+  await runWorkerLoop({
+    worker: "market-creator",
+    intervalMs: RUN_INTERVAL_HOURS * 3600 * 1000,
+    cycle: safeRun,
+  });
 }
 
 main().catch((err) => {

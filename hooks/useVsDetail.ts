@@ -54,6 +54,26 @@ import {
 import type { VSData } from "@/lib/contract";
 import type { VSCacheFreshness } from "@/lib/vs-freshness";
 
+// ── Activity row type ─────────────────────────────────────────────────────────
+//
+// Defined here (client-safe) rather than imported from the server-only
+// `lib/server/contract-activity` module, which must never be pulled into a
+// "use client" bundle.  Mirrors the shape produced by `readContractActivity`.
+
+export type ActivityKind = "created" | "challenged" | "resolved";
+
+export interface ActivityRow {
+  kind: ActivityKind;
+  /** Ledger sequence number of the event. */
+  ledger: number;
+  /** ISO timestamp of the event, if known. */
+  timestamp: string | null;
+  /** Transaction hash for the explorer link. */
+  txHash: string;
+  /** Actor address (creator / challenger / resolver), if known. */
+  actor: string | null;
+}
+
 // Re-export so consumers only need to import from one place.
 export { VS_DETAIL_POLL_INTERVAL_MS, VS_DETAIL_MAX_ATTEMPTS } from "@/lib/vs-detail-state";
 import type { VsDetailPhase } from "@/lib/vs-detail-state";
@@ -113,6 +133,15 @@ export interface UseVsDetailResult {
    * Returns a Promise that resolves once the fetch completes (or fails).
    */
   refresh: () => Promise<void>;
+  /**
+   * Activity rows (created / challenged / resolved) for this claim, fetched
+   * from `/api/vs/[id]/activity`.  Empty array until the first load completes.
+   */
+  activity: ActivityRow[];
+  /** True while the activity timeline is being fetched. */
+  activityLoading: boolean;
+  /** Error message from the last activity fetch, or null. */
+  activityError: string | null;
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
@@ -137,6 +166,11 @@ export function useVsDetail({
   const [cache, setCache] = useState<VSCacheFreshness | null>(null);
   const [fetchAttempts, setFetchAttempts] = useState(0);
   const [refreshing, setRefreshing] = useState(false);
+
+  // ── Activity timeline ─────────────────────────────────────────────────────
+  const [activity, setActivity] = useState<ActivityRow[]>([]);
+  const [activityLoading, setActivityLoading] = useState(false);
+  const [activityError, setActivityError] = useState<string | null>(null);
 
   // ── User context: challenge stake ─────────────────────────────────────────
 
@@ -185,6 +219,9 @@ export function useVsDetail({
       setFetchAttempts(0);
       setRefreshing(false);
       setPhase(isValidVsId(vsId) ? "loading" : "invalid");
+      setActivity([]);
+      setActivityLoading(false);
+      setActivityError(null);
     }
     prevVsIdRef.current = vsId;
   }, [vsId]);
@@ -296,11 +333,37 @@ export function useVsDetail({
     [vsId, address, inviteKey, isSampleVS]
   );
 
+  // ── Activity fetch ────────────────────────────────────────────────────────
+
+  const fetchActivity = useCallback(async (): Promise<void> => {
+    if (!isValidVsId(vsId) || isSampleVS) {
+      setActivity([]);
+      return;
+    }
+    setActivityLoading(true);
+    setActivityError(null);
+    try {
+      const res = await fetch(`/api/vs/${vsId}/activity`, {
+        headers: inviteKey ? { "x-invite-key": inviteKey } : undefined,
+      });
+      if (!res.ok) {
+        throw new Error(`activity fetch failed: ${res.status}`);
+      }
+      const body = (await res.json()) as { rows?: ActivityRow[] };
+      setActivity(Array.isArray(body.rows) ? body.rows : []);
+    } catch (err) {
+      setActivityError(err instanceof Error ? err.message : "activity fetch failed");
+      setActivity([]);
+    } finally {
+      setActivityLoading(false);
+    }
+  }, [vsId, inviteKey, isSampleVS]);
+
   // ── Manual refresh ────────────────────────────────────────────────────────
 
   const refresh = useCallback(async (): Promise<void> => {
-    await fetchVs({ isManual: true });
-  }, [fetchVs]);
+    await Promise.all([fetchVs({ isManual: true }), fetchActivity()]);
+  }, [fetchVs, fetchActivity]);
 
   // ── Push channel (SSE) with background-safe polling fallback ─────────────
 
@@ -312,6 +375,7 @@ export function useVsDetail({
 
     // Initial load.
     void fetchVs();
+    void fetchActivity();
 
     let eventSource: EventSource | null = null;
     let fallbackPollInterval: NodeJS.Timeout | null = null;
@@ -395,6 +459,7 @@ export function useVsDetail({
     function handleVisibilityChange() {
       if (document.visibilityState === "visible") {
         void fetchVs();
+        void fetchActivity();
         if (!eventSource) {
           connectSse();
         }
@@ -418,7 +483,7 @@ export function useVsDetail({
     // fetchVs is stable across vsId changes because the useEffect above resets
     // the generation counter, so including it here is safe.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [fetchVs, inviteKey, isSampleVS, vsId]);
+  }, [fetchVs, fetchActivity, inviteKey, isSampleVS, vsId]);
 
   // ── Return ────────────────────────────────────────────────────────────────
 
@@ -432,5 +497,8 @@ export function useVsDetail({
     setChallengeStake,
     resetChallengeStake,
     refresh,
+    activity,
+    activityLoading,
+    activityError,
   };
 }

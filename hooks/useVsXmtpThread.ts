@@ -1,11 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import {
-  ConsentState,
-  type DecodedMessage,
-  type Dm,
-} from "@xmtp/browser-sdk";
+import type { DecodedMessage, Dm } from "@xmtp/browser-sdk";
 import type { XmtpClientInstance } from "@/lib/xmtp/types";
 import {
   classifyXmtpThreadError,
@@ -15,9 +11,15 @@ import {
 } from "@/lib/xmtp/chat-thread";
 import {
   classifyXmtpFailureKind,
-  nextXmtpFailure,
+  nextXMtpFailure,
   type XmtpFailure,
 } from "@/lib/xmtp/failure-state";
+import {
+  loadReadState,
+  markThreadRead,
+  saveReadState,
+  type ReadStateMap,
+} from "@/lib/xmtp/read-state";
 
 const VISIBILITY_REFRESH_MIN_MS = 4000;
 
@@ -30,9 +32,9 @@ export type VsXmtpThreadError = {
 };
 
 export type UseVsXmtpThreadOptions = {
-  /** Wallet + VS elegible + peer conocido; no exige XMTP listo. */
+  /** Wallet + VS eligible + peer conocido; no exige XMTP listo. */
   threadEligible: boolean;
-  /** Cliente listo (solo con `xmtpStatus === "ready"`). */
+  /** Cliente listo (solo con `xmtpStatus === "ready"). */
   client: XmtpClientInstance | null;
   peerAddress: string;
 };
@@ -45,23 +47,23 @@ export type UseVsXmtpThreadResult = {
   /** El mismo fallo de apertura, ya clasificado para copy y reintento. */
   threadFailure: XmtpFailure | null;
   /**
-   * Fallo del stream con el hilo ya abierto. No destruye el hilo: los mensajes ya
+   * Fallo del stream con el hilo ya abierto. No destruye hilo: los mensajes ya
    * cargados siguen visibles, pero pueden estar desactualizados hasta que se
-   * reabra la conversación. Antes esto solo llegaba a `console.warn` y el panel
-   * seguía mostrando un hilo congelado sin ningún aviso.
+   * reabra la conversación. Antes esto solo llegaba a `console.warn` el panel
+   * seguía mostrando un hilo congelado sin ngun aviso.
    */
   streamFailure: XmtpFailure | null;
   isRefreshing: boolean;
   /** Sincroniza lista global + hilo y vuelve a cargar mensajes. */
   refreshThread: () => Promise<void>;
-  /** Reinicia apertura del hilo (p. ej. tras error). */
+  /** Reinicia apertura del hilo (p. ej: tras error). */
   retryOpenThread: () => void;
   clearThreadError: () => void;
 };
 
 /**
  * Ciclo de vida del DM 1v1 VS: sync/consent (Paso 6), stream en vivo,
- * refresco al volver a la pestaña (throttle) y refresco manual.
+ * refresco al volver a la pestaña (throttle) e y refresco manual.
  */
 export function useVsXmtpThread({
   threadEligible,
@@ -86,8 +88,8 @@ export function useVsXmtpThread({
   /**
    * El mismo fallo de apertura, ya clasificado en la taxonomía que la UI pinta.
    * `threadError` se conserva porque la maqueta de demo 1v1 decide con
-   * `kind === "peer_unreachable"`, y ese `kind` histórico no es 1:1 con
-   * `XmtpFailureKind` (p. ej. `network` de `classifyXmtpThreadError` se desglosa
+   * `kind === "peer_unreachable"`, y ese kind histórico no es 1:1 con
+   * `XmtpFailureKind` (p. ej: `network` de `classifyXmtpThreadError` se desglosa
    * en `network` o `timeout`).
    */
   const [threadFailure, setThreadFailure] = useState<XmtpFailure | null>(null);
@@ -102,6 +104,23 @@ export function useVsXmtpThread({
   const peerRef = useRef(peerAddress);
   const lastVisibilityRefreshAt = useRef(0);
   const wasHiddenRef = useRef(false);
+  const readStateRef = useRef<ReadStateMap | null>(null);
+
+  /**
+   * Marca el hilo como leído siempre que hay un hilo abierto y mensajes vistos.
+   * La ayuda de estado pura debe degradar silenciosamente si `safeStorage`
+   * falla (SSR, cuota, modo privado, etc.).
+   */
+  const markCurrentThreadRead = useCallback(() => {
+    const id = dmRef.current?.id;
+    if (!id) return;
+    const current = readStateRef.current ?? loadReadState();
+    const next = markThreadRead(current, id, Date.now());
+    readStateRef.current = next;
+    if (next !== current) {
+      saveReadState(next);
+    }
+  }, []);
 
   useEffect(() => {
     dmRef.current = dm;
@@ -130,9 +149,9 @@ export function useVsXmtpThread({
     (kind: XmtpThreadErrorKind, technical: string, cause?: unknown) => {
       setThreadError({ kind, technical });
       setThreadFailure((prev) =>
-        nextXmtpFailure(
+        nextXMtpFailure(
           prev,
-          classifyXmtpFailureKind(cause ?? technical),
+          classifyXmtpFailureKind(cause ??  technical),
           technical
         )
       );
@@ -159,15 +178,18 @@ export function useVsXmtpThread({
     setIsRefreshing(true);
     clearThreadError();
     try {
+      const { ConsentState } = await import("@xmtp/browser-sdk");
       await c.conversations.syncAll([ConsentState.Allowed]);
       await d.sync();
       const next = await loadThreadMessages(d);
       setMessages(next);
-      // A refresh that lands proves the transport is alive again, so the
+      // A fresh that lands proves the transport is alive again, so the
       // "messages may be stale" notice from a dead stream no longer applies.
       setStreamFailure(null);
+      // Viewing the thread counts as reading it.
+      markCurrentThreadRead();
     } catch (e) {
-      const { kind, message } = classifyXmtpThreadError(e);
+      const { kind, message } = classifyXMtpThreadError(e);
       if (isNonFatalSyncNotice(message)) {
         return;
       }
@@ -175,7 +197,7 @@ export function useVsXmtpThread({
     } finally {
       setIsRefreshing(false);
     }
-  }, [clearThreadError, isNonFatalSyncNotice, recordThreadError]);
+  }, [clearThreadError, isNonFatalSyncNotice, markCurrentThreadRead, recordThreadError]);
 
   const throttledVisibilityRefresh = useCallback(() => {
     const now = Date.now();
@@ -218,6 +240,8 @@ export function useVsXmtpThread({
         setDm(opened);
         setMessages(initial);
         setPhase("ready");
+        // Opening a thread counts as reading it.
+        markThreadRead(opened.id, Date.now());
 
         const stream = await opened.stream({
           onValue: (msg) => {
@@ -230,6 +254,8 @@ export function useVsXmtpThread({
                 (a, b) => a.sentAt.getTime() - b.sentAt.getTime()
               );
             });
+            // A message viewed in the open thread counts as read.
+            markThreadRead(opened.id, Date.now());
           },
           onError: (err) => {
             if (myGen !== initGen.current) return;

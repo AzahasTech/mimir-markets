@@ -94,7 +94,7 @@ export interface ApiError extends ApiErrorShape {
      * request.
      *
      * An agent reading only its own logs would otherwise have to guess which of
-     * its many in-flight calls produced a `429`. One field, additive, and
+     * its many in-flight calls produced a 429. One field, additive, and
      * meaningless to an agent that ignores it.
      */
     trace_id?: string;

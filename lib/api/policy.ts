@@ -1,12 +1,12 @@
 /**
- * Access tiers for API routes (§11).
+ * Access tiers for API routes (#11).
  *
  * Four kinds of caller reach these routes and they need different things checked.
  * Before this, each route decided for itself — which is how one of them ends up
  * reading a secret from the wrong header, or forgetting a rate limit, and nobody
  * notices because there is no single place to look.
  *
- *   public_read        anyone, including an OG scraper with no session
+ *   public_read        anyone, including an OG scrapper with no session
  *   authenticated_user a wallet acting for itself
  *   registered_agent   an agent acting under a signed, replay-protected envelope
  *   internal_worker    a cron or worker holding the shared secret

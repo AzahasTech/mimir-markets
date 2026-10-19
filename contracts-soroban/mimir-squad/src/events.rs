@@ -1,4 +1,4 @@
-//! Typed contract events, mirroring the `event` declarations in MimirSquad.sol.
+/// Typed contract events, mirroring the `event` declarations in MimirSquad.sol.
 
 use soroban_sdk::{contractevent, Address, String};
 
@@ -166,6 +166,33 @@ pub struct OracleChanged {
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OracleCancelled {
+    pub cancelled: bool,
+}
+
+/// Emitted when the current fee recipient queues a rotation to a new address.
+/// The rotation becomes executable only at or after `executable_at`.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeRecipientQueued {
+    #[topic]
+    pub next: Address,
+    pub executable_at: u64,
+}
+
+/// Emitted when a queued fee recipier rotation is executed after the timelock.
+/// Any fees accrued but unclaimed at execution time are payable to ``next``.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeRecipientChanged {
+    #[topic]
+    pub next: Address,
+    pub previous: Address,
+}
+
+/// Emitted when a queued fee recipient rotation is cancelled by the current recipient.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeRecipientCancelled {
     pub cancelled: bool,
 }
 

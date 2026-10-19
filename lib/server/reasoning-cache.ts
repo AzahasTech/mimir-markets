@@ -15,6 +15,8 @@
  * it to Neon only if cross-instance misses show up as real LLM spend.
  */
 
+import { checkPublishableText } from "@/lib/reasoning/redact";
+
 export const TTL_MS = 10 * 60 * 1000;
 const MAX_ENTRIES = 200;
 
@@ -23,6 +25,14 @@ export interface CachedReasoning {
   sideA: string;
   sideB: string;
   reasoning: string;
+}
+
+/**
+ * Returns true when the generated reasoning is safe to publish. Unsafe
+ * generations must be neither cached nor returned to readers.
+ */
+export function isPublishableReasoning(reasoning: string): boolean {
+  return checkPublishableText(reasoning).ok;
 }
 
 export type Entry = CachedReasoning & { at: number };
@@ -55,6 +65,10 @@ export function setCachedReasoning(
   value: CachedReasoning,
   nowMs = Date.now()
 ): void {
+  // Never cache unsafe generations — they must not be served to readers.
+  if (!isPublishableReasoning(value.reasoning)) {
+    return;
+  }
   const key = cacheKey(claimId, slug);
   // Re-insert so the key moves to the back of the eviction order.
   entries.delete(key);
